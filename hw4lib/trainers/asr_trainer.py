@@ -21,14 +21,12 @@ class ASRTrainer(BaseTrainer):
     2. Validation loop for model evaluation
     3. Recognition capabilities with different decoding strategies (greedy, beam search)
     4. Language model shallow fusion during recognition
-
     Implementation Tasks:
     - TODO: Initialize CE and CTC loss in __init__
     - TODO: Implement key parts of the training loop in _train_epoch
     - TODO: Implement recognition functionality in recognize
     - TODO: Implement key parts of the validation loop in _validate_epoch
     - TODO: Implement key parts of the full training loop in train
-
     Implementation Notes:
     1. For __init__:
         - Initialize CrossEntropyLoss with appropriate padding index and label smoothing
@@ -107,7 +105,13 @@ class ASRTrainer(BaseTrainer):
             
             with torch.autocast(device_type=self.device, dtype=torch.float16):
                 # Get raw predictions and attention weights and ctc inputs from model
-                seq_out, curr_att, ctc_inputs = self.model(feats, targets_shifted, feat_lengths, transcript_lengths)
+                # 修复：明确指定source_lengths和target_lengths参数
+                seq_out, curr_att, ctc_inputs = self.model(
+                    feats, 
+                    targets_shifted, 
+                    source_lengths=feat_lengths,
+                    target_lengths=transcript_lengths
+                )
                 
                 # Update running_att with the latest attention weights
                 running_att = curr_att
@@ -186,7 +190,7 @@ class ASRTrainer(BaseTrainer):
             'perplexity_token': avg_perplexity_token.item(),
             'perplexity_char': avg_perplexity_char.item()
         }, running_att
-
+    
     def _validate_epoch(self, dataloader):
         """
         Validate for one epoch.
@@ -313,7 +317,7 @@ class ASRTrainer(BaseTrainer):
                 continue
         
         return eval_results
-
+    
     def recognize(self, dataloader, recognition_config: Optional[Dict[str, Any]] = None, config_name: Optional[str] = None, max_length: Optional[int] = None) -> List[Dict[str, Any]]:
         """
         Evaluate the model by generating transcriptions from audio features.
@@ -439,7 +443,7 @@ class ASRTrainer(BaseTrainer):
                     break
             batch_bar.close()
             return results
-
+    
     def _get_evaluation_recognition_configs(self, lm_model: Optional[DecoderOnlyTransformer] = None, lm_weight: float = 0.0) -> Dict[str, Dict[str, Any]]:
         """
         Get a list of recognition configurations for seqential evaluation.
@@ -508,14 +512,12 @@ class ProgressiveTrainer(ASRTrainer):
     2. Gradual unfreezing of model layers
     3. Dynamic data subsetting
     4. Smooth transition to full model training
-
     Implementation Tasks:
     - Store original model layers in __init__
     - Configure model for each stage in configure_stage
     - Implement progressive training loop in progressive_train
     - Handle transition to full training in transition_to_full_training
     - Create data subsets in get_subset_dataloader
-
     Implementation Notes:
     1. For __init__:
         - Store original encoder and decoder layers
@@ -652,7 +654,7 @@ class ProgressiveTrainer(ASRTrainer):
         # Store original layer states
         self.all_encoder_layers = list(self.model.enc_layers)
         self.all_decoder_layers = list(self.model.dec_layers)
-
+    
     def configure_stage(self, stage_config):
         """Configure model for current training stage"""
         # Create a pretty header
@@ -746,7 +748,7 @@ class ProgressiveTrainer(ASRTrainer):
             # Get subset of train_dataloader
             subset_train_dataloader = self.get_subset_dataloader(train_dataloader, stage_config['data_subset'])
             super().train(subset_train_dataloader, val_dataloader, epochs=stage_config['epochs'])
-
+    
     def transition_to_full_training(self):
         """Transition from progressive training to full training"""
         print("\n=== Transitioning to Full Training ===")
@@ -783,7 +785,7 @@ class ProgressiveTrainer(ASRTrainer):
         """
         self.transition_to_full_training()
         super().train(train_dataloader, val_dataloader, epochs=epochs)
-
+    
     def get_subset_dataloader(self, dataloader, subset_fraction):
         """
         Creates a new DataLoader with a subset of the original data while preserving dataset attributes.
