@@ -284,9 +284,6 @@ class EncoderDecoderTransformer(nn.Module):
         # Weight tying if enabled (extra form of regularization, read more about it)
         if weight_tying:
             self.target_embedding.weight = self.final_linear.weight
-        
-        # 用于训练状态
-        self.training = True
             
     def encode(self, padded_sources: torch.Tensor, source_lengths: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, dict, dict]:
         '''
@@ -419,17 +416,13 @@ class EncoderDecoderTransformer(nn.Module):
                         Keys: 'log_probs' and 'lengths'
                         Required for CTC loss computation
         '''
-        # 修改检查条件，允许在训练模式下即使没有target_lengths也能运行
-        # if self.training and target_lengths is None:
-        #     raise ValueError("target_lengths must be provided during training")
-        # if self.training and source_lengths is None:
-        #     raise ValueError("source_lengths must be provided during training")
-        
-        # 确保source_lengths不为None
-        if source_lengths is None:
-            # 如果没有提供source_lengths，假设源序列填充到最大长度
-            source_lengths = torch.ones(padded_sources.size(0), device=padded_sources.device) * padded_sources.size(1)
-        
+        # 修复：在训练期间需要提供target_lengths和source_lengths
+        if self.training and target_lengths is None:
+            raise ValueError("target_lengths must be provided during training")
+            
+        if self.training and source_lengths is None:
+            raise ValueError("source_lengths must be provided during training")
+            
         # 编码源序列
         encoder_output, pad_mask_src, enc_running_att, ctc_inputs = self.encode(padded_sources, source_lengths)
         
