@@ -21,12 +21,14 @@ class ASRTrainer(BaseTrainer):
     2. Validation loop for model evaluation
     3. Recognition capabilities with different decoding strategies (greedy, beam search)
     4. Language model shallow fusion during recognition
+
     Implementation Tasks:
     - TODO: Initialize CE and CTC loss in __init__
     - TODO: Implement key parts of the training loop in _train_epoch
     - TODO: Implement recognition functionality in recognize
     - TODO: Implement key parts of the validation loop in _validate_epoch
     - TODO: Implement key parts of the full training loop in train
+
     Implementation Notes:
     1. For __init__:
         - Initialize CrossEntropyLoss with appropriate padding index and label smoothing
@@ -105,13 +107,8 @@ class ASRTrainer(BaseTrainer):
             
             with torch.autocast(device_type=self.device, dtype=torch.float16):
                 # Get raw predictions and attention weights and ctc inputs from model
-                # 修复：明确指定source_lengths和target_lengths参数
-                seq_out, curr_att, ctc_inputs = self.model(
-                    feats, 
-                    targets_shifted, 
-                    source_lengths=feat_lengths,
-                    target_lengths=transcript_lengths
-                )
+                # seq_out, curr_att, ctc_inputs = self.model(feats, targets_shifted, feat_lengths)
+                seq_out, curr_att, ctc_inputs = self.model(feats, targets_shifted, feat_lengths, transcript_lengths)
                 
                 # Update running_att with the latest attention weights
                 running_att = curr_att
@@ -122,9 +119,10 @@ class ASRTrainer(BaseTrainer):
                 # Calculate CTC loss if needed
                 if self.ctc_weight > 0:
                     ctc_loss = self.ctc_criterion(
-                        ctc_inputs.['log_probs'],   # (T, B, C) -> (B, T, C)
+                        ctc_inputs['log_probs'],      # (T, B, C) -> (B, T, C)
                         targets_golden,               # (B, T)
-                        feat_lengths,                 # (B)
+                        #feat_lengths,                 # (B)
+                        ctc_inputs['lengths'],
                         transcript_lengths            # (B)
                     )
                     loss = ce_loss + self.ctc_weight * ctc_loss
@@ -190,7 +188,7 @@ class ASRTrainer(BaseTrainer):
             'perplexity_token': avg_perplexity_token.item(),
             'perplexity_char': avg_perplexity_char.item()
         }, running_att
-    
+
     def _validate_epoch(self, dataloader):
         """
         Validate for one epoch.
@@ -317,7 +315,7 @@ class ASRTrainer(BaseTrainer):
                 continue
         
         return eval_results
-    
+
     def recognize(self, dataloader, recognition_config: Optional[Dict[str, Any]] = None, config_name: Optional[str] = None, max_length: Optional[int] = None) -> List[Dict[str, Any]]:
         """
         Evaluate the model by generating transcriptions from audio features.
@@ -395,7 +393,7 @@ class ASRTrainer(BaseTrainer):
                 generator.score_fn = get_score
                 # Initialize prompts as a batch of SOS tokens
                 batch_size = feats.size(0)
-                prompts = torch.full((batch_size, 1), self.tokenizer.sos_token_id, dtype=torch.long, device=self.device)
+                prompts = torch.full((batch_size, 1), self.tokenizer.sos_id, dtype=torch.long, device=self.device)
                 
                 # Generate sequences
                 if recognition_config['beam_width'] > 1:
@@ -443,7 +441,7 @@ class ASRTrainer(BaseTrainer):
                     break
             batch_bar.close()
             return results
-    
+
     def _get_evaluation_recognition_configs(self, lm_model: Optional[DecoderOnlyTransformer] = None, lm_weight: float = 0.0) -> Dict[str, Dict[str, Any]]:
         """
         Get a list of recognition configurations for seqential evaluation.
@@ -502,3 +500,328 @@ class ASRTrainer(BaseTrainer):
             'wer': wer.item() * 100,
             'cer': cer.item() * 100
         }
+    
+# -------------------------------------------------------------------------------------------------
+class ProgressiveTrainer(ASRTrainer):
+    """
+    Progressive Trainer class that implements curriculum learning for ASR training.
+    This trainer extends ASRTrainer to implement:
+    1. Stage-based training with increasing model complexity
+    2. Gradual unfreezing of model layers
+    3. Dynamic data subsetting
+    4. Smooth transition to full model training
+
+    Implementation Tasks:
+    - Store original model layers in __init__
+    - Configure model for each stage in configure_stage
+    - Implement progressive training loop in progressive_train
+    - Handle transition to full training in transition_to_full_training
+    - Create data subsets in get_subset_dataloader
+
+    Implementation Notes:
+    1. For __init__:
+        - Store original encoder and decoder layers
+        - Initialize stage counter
+        
+    2. For configure_stage:
+        - Update dropout and label smoothing
+        - Activate specified encoder and decoder layers
+        - Handle layer freezing based on configuration
+        - Print detailed configuration information
+        
+    3. For progressive_train:
+        - Configure model for each stage
+        - Create appropriate data subset
+        - Train using parent class methods
+        
+    4. For transition_to_full_training:
+        - Restore all model layers
+        - Reset loss function parameters
+        - Unfreeze all parameters
+        - Reset best metrics
+        
+    5. For get_subset_dataloader:
+        - Create subset while preserving dataset attributes
+        - Maintain collate function and other dataloader settings
+    # -------------------------------------------------------------------------------------------------
+    ##### Stage Configuration
+    Each stage is defined as a dictionary with the following parameters:
+    ```python
+    {
+        'name': str,                        # Name of the training stage
+        'epochs': int,                      # Number of epochs to train in this stage
+        'encoder_active_layers': List[int], # Which encoder layers to use
+        'decoder_active_layers': List[int], # Which decoder layers to use
+        'encoder_freeze': List[bool],       # Whether to freeze each encoder layer
+        'decoder_freeze': List[bool],       # Whether to freeze each decoder layer
+        'dropout': float,                   # Dropout rate for this stage
+        'label_smoothing': float,           # Label smoothing value
+        'data_subset': float                # Fraction of training data to use (0.0-1.0)
+    }
+    ```
+    #### Example
+    It is best understood by an example. Here is a breakdown of the stages defined below for a model with 6 encoder and 6 decoder layers:
+    stages = [
+                {
+                    # `Initial (1 layers)`:
+                    # This stage starts with a model with only 1 encoder and 1 decoder layer.
+                    # No freezing or regularization is applied.
+                    # It uses 20% of the training data.
+                    'name': 'Initial (1 Encoder + 1 Decoder layers)',
+                    'epochs': 5,
+                    'encoder_active_layers': list(range(1)),
+                    'decoder_active_layers': list(range(1)),
+                    'encoder_freeze': [False],
+                    'decoder_freeze': [False],
+                    'dropout': 0.0,
+                    'label_smoothing': 0.0,
+                    'data_subset': 0.2
+                },
+                {
+                    # `2 layers`:
+                    # This stage increases the number of layers to 2 for both the encoder and decoder.
+                    # The previous layer (encoder layer 1 and decoder layer 1) are frozen.
+                    # No regularization is applied.
+                    # It uses 20% of the training data.
+                    'name': '2 Encoder + 2 Decoder layers',
+                    'epochs': 5,
+                    'encoder_active_layers': list(range(2)),
+                    'decoder_active_layers': list(range(2)),
+                    'encoder_freeze': [True, False],
+                    'decoder_freeze': [True, False],
+                    'dropout': 0.0,
+                    'label_smoothing': 0.0,
+                    'data_subset': 0.2
+                },
+                {
+                    # `4 layers`:
+                    # This stage increases the number of layers to 4 for both the encoder and decoder.
+                    # The previous layers (encoder layers 1 and 2 and decoder layers 1 and 2) are frozen.
+                    # Dropout is set to 0.05 and label smoothing is set to 0.0.
+                    # It uses 20% of the training data.
+                    'name': '4 Encoder + 4 Decoder layers',
+                    'epochs': 5,
+                    'encoder_active_layers': list(range(4)),
+                    'decoder_active_layers': list(range(4)),
+                    'encoder_freeze': [True, True, False, False],
+                    'decoder_freeze': [True, True, False, False],
+                    'dropout': 0.05,
+                    'label_smoothing': 0.0,
+                    'data_subset': 0.2
+                },
+                {
+                    # `All 6 layers`:
+                    # This stage uses all 6 encoder and 6 decoder layers.
+                    # The 4 previous layers are frozen and the last 2 layers are trained.
+                    # Dropout is set to 0.1 and label smoothing is set to 0.0.
+                    # It uses 20% of the training data.
+                    'name': '6 Encoder + 6 Decoder layers',
+                    'epochs': 5,
+                    'encoder_active_layers': list(range(6)),
+                    'decoder_active_layers': list(range(6)),
+                    'encoder_freeze': [True, True, True, True, False, False],
+                    'decoder_freeze': [True, True, True, True, False, False],
+                    'dropout': 0.1,
+                    'label_smoothing': 0.0,
+                    'data_subset': 0.2
+                },
+                {
+                    # `Final (with label smoothing)`:
+                    # This stage uses all 6 encoder and 6 decoder layers.
+                    # All layers are unfrozen and trained.
+                    # Dropout is set to 0.1 and label smoothing is set to 0.1.
+                    # It uses 20% of the training data.
+                    'name': 'Final (with label smoothing)',
+                    'epochs': 5,
+                    'encoder_active_layers': list(range(6)),
+                    'decoder_active_layers': list(range(6)),
+                    'encoder_freeze': [False, False, False, False, False, False],
+                    'decoder_freeze': [False, False, False, False, False, False],
+                    'dropout': 0.1,
+                    'label_smoothing': 0.1,
+                    'data_subset': 0.2
+                }
+            ]    
+    ##### Important Notes
+    - Ensure `encoder_freeze` and `decoder_freeze` lists match the length of their respective `active_layers`
+    - `data_subset` should be between 0 and 1
+    - Stage transitions are handled automatically by the trainer
+    - The same optimizer and scheduler are used for all stages so keep that in mind while setting the learning rates and other parameters
+    """
+    def __init__(self, model, tokenizer, config, run_name, config_file, device=None):
+        super().__init__(model, tokenizer, config, run_name, config_file, device)
+        self.current_stage = 0
+        # Store original layer states
+        self.all_encoder_layers = list(self.model.enc_layers)
+        self.all_decoder_layers = list(self.model.dec_layers)
+
+    def configure_stage(self, stage_config):
+        """Configure model for current training stage"""
+        # Create a pretty header
+        print("\n" + "="*80)
+        print(f"Starting Stage: {stage_config['name']}".center(80))
+        print("="*80)
+        
+        # Print key configuration details
+        print(f"\nConfiguration Details:")
+        print(f"├── Data Subset: {stage_config['data_subset']*100:.1f}% of training data")
+        print(f"├── Training Epochs: {stage_config['epochs']}")
+        print(f"├── Dropout: {stage_config['dropout']}")
+        print(f"├── Label Smoothing: {stage_config['label_smoothing']}")
+        
+        # Update dropout and label smoothing
+        self.model.dropout.p = stage_config['dropout']
+        self.ce_criterion = nn.CrossEntropyLoss(
+            ignore_index=self.tokenizer.pad_id,
+            label_smoothing=stage_config['label_smoothing']
+        )
+        
+        # Get freeze configurations
+        encoder_freeze = stage_config.get('encoder_freeze', [])
+        decoder_freeze = stage_config.get('decoder_freeze', [])
+        
+        # Activate and configure encoder layers
+        encoder_active_layers = stage_config['encoder_active_layers']
+        if encoder_freeze and len(encoder_freeze) != len(encoder_active_layers):
+            raise ValueError(f"Encoder freeze list length ({len(encoder_freeze)}) must match number of active encoder layers ({len(encoder_active_layers)})")
+        
+        # Set the active encoder layers of the model
+        self.model.enc_layers = nn.ModuleList([
+            self.all_encoder_layers[i] for i in encoder_active_layers
+        ])
+        self.model.num_encoder_layers = len(encoder_active_layers)
+        
+        # Activate and configure decoder layers
+        decoder_active_layers = stage_config['decoder_active_layers']
+        if decoder_freeze and len(decoder_freeze) != len(decoder_active_layers):
+            raise ValueError(f"Decoder freeze list length ({len(decoder_freeze)}) must match number of active decoder layers ({len(decoder_active_layers)})")
+        
+        # Set the active decoder layers of the model
+        self.model.dec_layers = nn.ModuleList([
+            self.all_decoder_layers[i] for i in decoder_active_layers
+        ])
+        self.model.num_decoder_layers = len(decoder_active_layers)
+        # Handle layer freezing
+        frozen_count = 0
+        trainable_count = 0
+        
+        # Configure encoder layers freezing
+        print("├── Encoder Layers:")
+        for idx, layer in enumerate(self.model.enc_layers):
+            should_freeze = encoder_freeze[idx]
+            for param in layer.parameters():
+                param.requires_grad = not should_freeze
+                if should_freeze:
+                    frozen_count += param.numel()
+                else:
+                    trainable_count += param.numel()
+            print(f"│   ├── Layer {encoder_active_layers[idx]}: {'Frozen' if should_freeze else 'Trainable'}")
+        
+        # Configure decoder layers
+        print("├── Decoder Layers:")
+        for idx, layer in enumerate(self.model.dec_layers):
+            should_freeze = decoder_freeze[idx]
+            for param in layer.parameters():
+                param.requires_grad = not should_freeze
+                if should_freeze:
+                    frozen_count += param.numel()
+                else:
+                    trainable_count += param.numel()
+            print(f"│   ├── Layer {decoder_active_layers[idx]}: {'Frozen' if should_freeze else 'Trainable'}")
+        
+        print(f"├── Frozen Parameters: {frozen_count:,}")
+        print(f"└── Trainable Parameters: {trainable_count:,}")
+    
+    def progressive_train(self, train_dataloader, val_dataloader, stages: List[Dict[str, Any]]):
+        """
+        Progressive training through stages
+        Each stage configuration is defined as a dictionary with the following parameters:
+        Args:
+            train_dataloader: DataLoader for training data
+            val_dataloader: DataLoader for validation data
+            stages: List of dictionaries containing stage configuration
+        """
+        # Train through stages
+        for stage_idx, stage_config in enumerate(stages):
+            self.current_stage = stage_idx
+            self.configure_stage(stage_config)
+            # Get subset of train_dataloader
+            subset_train_dataloader = self.get_subset_dataloader(train_dataloader, stage_config['data_subset'])
+            super().train(subset_train_dataloader, val_dataloader, epochs=stage_config['epochs'])
+
+    def transition_to_full_training(self):
+        """Transition from progressive training to full training"""
+        print("\n=== Transitioning to Full Training ===")
+        
+        # Restore all layers
+        self.model.enc_layers = nn.ModuleList(self.all_encoder_layers)
+        self.model.dec_layers = nn.ModuleList(self.all_decoder_layers)
+        self.model.num_encoder_layers = len(self.all_encoder_layers)
+        self.model.num_decoder_layers = len(self.all_decoder_layers)
+        # Restore CrossEntropyLoss
+        self.ce_criterion = nn.CrossEntropyLoss(
+            ignore_index=self.tokenizer.pad_id,
+            label_smoothing=self.config['loss']['label_smoothing']
+        )
+        
+        # Unfreeze all parameters
+        unfrozen_count = 0
+        for param in self.model.parameters():
+            param.requires_grad = True
+            unfrozen_count += param.numel()
+        print(f"├── Total Unfrozen Parameters: {unfrozen_count:,}")
+        
+        # Reset best metrics for new training phase
+        self.best_metric = float('inf')
+    
+    def train(self, train_dataloader, val_dataloader, epochs):
+        """
+        Run full training phase.
+        It is recommended to set the optimizer and scheduler explicitly before calling this function.
+        like this:
+        cls.optimizer = create_optimizer(self.model, self.config['optimizer'])
+        cls.scheduler = create_scheduler(cls.optimizer, cls.config['scheduler'], train_dataloader)
+        cls.progressive_train(train_dataloader, val_dataloader, stages)
+        """
+        self.transition_to_full_training()
+        super().train(train_dataloader, val_dataloader, epochs=epochs)
+
+    def get_subset_dataloader(self, dataloader, subset_fraction):
+        """
+        Creates a new DataLoader with a subset of the original data while preserving dataset attributes.
+        
+        Args:
+            dataloader: Original DataLoader
+            subset_fraction: Float between 0 and 1 indicating what fraction of data to keep
+        
+        Returns:
+            New DataLoader containing only the subset of data
+        """
+        # Calculate how many samples we want to keep
+        dataset = dataloader.dataset
+        total_samples = len(dataset)
+        subset_size = int(total_samples * subset_fraction)
+        
+        # Create random indices for the subset
+        indices = torch.randperm(total_samples)[:subset_size]
+        
+        # Create a Subset dataset
+        subset_dataset = Subset(dataset, indices)
+        
+        # Add necessary attributes from original dataset to subset
+        subset_dataset.text_max_len = dataset.text_max_len
+        subset_dataset.feat_max_len = dataset.feat_max_len
+        subset_dataset.get_avg_chars_per_token = dataset.get_avg_chars_per_token
+        
+        # Create new DataLoader with same configuration as original
+        subset_loader = torch.utils.data.DataLoader(
+            subset_dataset,
+            batch_size=self.config['data']['batch_size'],
+            shuffle=True,
+            num_workers=self.config['data']['NUM_WORKERS'],
+            collate_fn=dataset.collate_fn,
+            pin_memory=True
+        )
+        
+        return subset_loader
+        
